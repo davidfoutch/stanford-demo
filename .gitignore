@@ -5,3 +5,5 @@ __pycache__/
 var/log/
 *.log
 
+artifacts/
+
