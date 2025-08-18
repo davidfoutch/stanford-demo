@@ -7,3 +7,8 @@ var/log/
 
 artifacts/
 
+artifacts/
+.chroma/
+var/log/
+*.log
+
