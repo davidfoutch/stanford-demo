@@ -2,6 +2,7 @@ from fastapi import FastAPI
 from pydantic import BaseModel
 from typing import Optional
 import os
+import requests
 from pathlib import Path
 
 from src.companion.session import ChatSession
@@ -9,14 +10,66 @@ from src.companion.example_llm import llm_call
 
 from fastapi.responses import HTMLResponse
 from fastapi import Query
-import pandas as pd, json
+import pandas as pd, numpy as np, json
 from Bio.PDB import PDBParser, is_aa
+from scipy.spatial import cKDTree
 
 app = FastAPI(title="Stanford Demo API")
+
+def fetch_pdb_rcsb(pdb_id: str) -> str:
+    pdb_id = pdb_id.upper()
+    out = Path(f"data/cache/pdb/{pdb_id}.pdb")
+    out.parent.mkdir(parents=True, exist_ok=True)
+    if not out.exists():
+        url = f"https://files.rcsb.org/download/{pdb_id}.pdb"
+        r = requests.get(url, timeout=20); r.raise_for_status()
+        out.write_text(r.text)
+    return str(out)
+
+def _build_psn_weighted(pdb_path: str, cutoff: float = 4.5, chains=None, heavy_only: bool = True) -> pd.DataFrame:
+    parser = PDBParser(QUIET=True); s = parser.get_structure("s", pdb_path)
+    chains = set(chains) if chains else None
+    res_ids, coords = [], []
+    for model in s:
+        for ch in model:
+            if chains and ch.id not in chains: continue
+            for res in ch:
+                if not is_aa(res, standard=True): continue
+                for atom in res:
+                    if heavy_only and atom.element == "H": continue
+                    res_ids.append(f"{ch.id}:{res.get_id()[1]}"); coords.append(atom.coord)
+    coords = np.asarray(coords, dtype=float)
+    tree = cKDTree(coords); pairs = tree.query_pairs(r=cutoff)
+    from collections import defaultdict
+    edge = defaultdict(list)
+    for i,j in pairs:
+        a,b = res_ids[i], res_ids[j]
+        if a==b: continue
+        u,v = (a,b) if a<b else (b,a)
+        d = float(np.linalg.norm(coords[i]-coords[j]))
+        edge[(u,v)].append(d)
+    rows = []
+    for (u,v), ds in edge.items():
+        cnt = len(ds); avg = sum(ds)/cnt; w = cnt*avg
+        rows.append((u,v,w,cnt,avg))
+    return pd.DataFrame(rows, columns=["Residue1","Residue2","Weight","Contacts","AvgDist"])
 
 @app.get("/health")
 def health():
     return {"ok": True}
+
+@app.get("/viz/psn_build", response_class=HTMLResponse)
+def viz_psn_build(pdb_id: str, chains: str="A", cutoff: float=4.5, kmin: int=0, style: str="cartoon"):
+    pdb_path = fetch_pdb_rcsb(pdb_id)
+    chain_list = [c.strip() for c in chains.split(",") if c.strip()]
+    wdf = _build_psn_weighted(pdb_path, cutoff=cutoff, chains=chain_list, heavy_only=True)
+
+    out_csv = Path(f"artifacts/runs/psn/{pdb_id}_c{cutoff}_{'-'.join(chain_list) or 'ALL'}.csv")
+    out_csv.parent.mkdir(parents=True, exist_ok=True)
+    wdf.to_csv(out_csv, index=False)
+
+    # Reuse the existing overlay viewer
+    return viz_psn_net(pdb_path=pdb_path, edges_csv=str(out_csv), kmin=kmin, style=style)
 
 # --- Companion ---
 class ChatIn(BaseModel):
@@ -63,12 +116,58 @@ def _ca_coords(pdb_path: str):
                     out[f"{ch.id}:{res.get_id()[1]}"] = res["CA"].coord.tolist()
     return out
 
+def fetch_pdb_rcsb(pdb_id: str) -> str:
+    pdb_id = pdb_id.upper()
+    out = Path(f"data/cache/pdb/{pdb_id}.pdb")
+    out.parent.mkdir(parents=True, exist_ok=True)
+    if not out.exists():
+        url = f"https://files.rcsb.org/download/{pdb_id}.pdb"
+        r = requests.get(url, timeout=20)
+        r.raise_for_status()
+        out.write_text(r.text)
+    return str(out)
+
+def _build_psn_weighted(pdb_path: str, cutoff: float = 4.5, chains=None, heavy_only: bool = True) -> pd.DataFrame:
+    parser = PDBParser(QUIET=True); s = parser.get_structure("s", pdb_path)
+    chains = set(chains) if chains else None
+    res_ids, coords = [], []
+    for model in s:
+        for ch in model:
+            if chains and ch.id not in chains: continue
+            for res in ch:
+                if not is_aa(res, standard=True): continue
+                for atom in res:
+                    if heavy_only and atom.element == "H": continue
+                    res_id = f"{ch.id}:{res.get_id()[1]}"
+                    res_ids.append(res_id); coords.append(atom.coord)
+    coords = np.asarray(coords, dtype=float)
+    tree = cKDTree(coords)
+    pairs = tree.query_pairs(r=cutoff)
+    from collections import defaultdict
+    edge = defaultdict(list)
+    for i,j in pairs:
+        a,b = res_ids[i], res_ids[j]
+        if a==b: continue
+        u,v = (a,b) if a<b else (b,a)
+        d = float(np.linalg.norm(coords[i]-coords[j]))
+        edge[(u,v)].append(d)
+    rows = []
+    for (u,v), ds in edge.items():
+        cnt = len(ds); avg = sum(ds)/cnt; w = cnt*avg
+        rows.append((u,v,w,cnt,avg))
+    return pd.DataFrame(rows, columns=["Residue1","Residue2","Weight","Contacts","AvgDist"])
+
+
+# --- ROUTE A: overlay a given PDB path + edges CSV ---
 @app.get("/viz/psn_net", response_class=HTMLResponse)
 def viz_psn_net(
-    pdb_path: str = Query(..., description="Absolute path to local PDB"),
-    edges_csv: str = Query(..., description="CSV with u,v or Residue1,Residue2 (+ optional Contacts/Weight)"),
+    pdb_path: str = Query(...),
+    edges_csv: str = Query(...),
     kmin: int = 0,
     style: str = "cartoon",
+    weight_by: str = "Contacts",   # or "Weight"
+    rmin: float = 0.06,
+    rmax: float = 0.35,
 ):
     try:
         df = pd.read_csv(edges_csv)
@@ -77,13 +176,20 @@ def viz_psn_net(
             df = df[df['Contacts'] >= kmin]
 
         coords = _ca_coords(pdb_path)
+        hasC = 'Contacts' in df.columns
+        hasW = 'Weight'   in df.columns
+        metric = weight_by if (weight_by in df.columns) else ("Contacts" if hasC else ("Weight" if hasW else None))
+
         cyl = []
-        for _, r in df.iterrows():
-            a, b = r[u], r[v]
+        for _, row in df.iterrows():
+            a, b = row[u], row[v]
             if a in coords and b in coords:
-                (x1,y1,z1) = coords[a]
-                (x2,y2,z2) = coords[b]
-                cyl.append(dict(x1=x1,y1=y1,z1=z1, x2=x2,y2=y2,z2=z2))
+                x1, y1, z1 = coords[a]
+                x2, y2, z2 = coords[b]
+                C = int(row['Contacts']) if hasC else 1
+                W = float(row['Weight']) if hasW else 1.0
+                M = float(row[metric]) if metric else 1.0
+                cyl.append({"x1":x1,"y1":y1,"z1":z1,"x2":x2,"y2":y2,"z2":z2,"C":C,"W":W,"M":M})
 
         edges_js = json.dumps(cyl)
         pdb_js   = json.dumps(Path(pdb_path).read_text())
@@ -95,26 +201,70 @@ def viz_psn_net(
         }
         style_obj_js = json.dumps(style_map.get(style, style_map["cartoon"]))
 
-        html = f"""<!doctype html><html><head>
+        html = """
+<!doctype html><html><head>
 <meta charset="utf-8" />
 <script src="https://cdnjs.cloudflare.com/ajax/libs/3Dmol/2.0.5/3Dmol-min.js"></script>
-<style>html,body,#viewer{{height:100%;margin:0}}#viewer{{width:100%;height:100%}}</style>
+<style>html,body,#viewer{height:100%%;margin:0}#viewer{width:100%%;height:100%%}</style>
 </head><body><div id="viewer"></div>
 <script>
-let v=$3Dmol.createViewer(document.getElementById('viewer'),{{backgroundColor:'white'}});
-v.addModel({pdb_js},"pdb");                 // embed PDB text (not a path)
-v.setStyle({{}}, {style_obj_js});
-v.addSurface($3Dmol.VDW, {{opacity:0.6, color:'white'}});
-let E={edges_js};
-for (const e of E) {{
-  v.addCylinder({{
-    start:{{x:e.x1,y:e.y1,z:e.z1}},
-    end:  {{x:e.x2,y:e.y2,z:e.z2}},
-    radius:0.12, fromCap:1, toCap:1, color:'red'
-  }});
-}}
+let v=$3Dmol.createViewer(document.getElementById('viewer'),{backgroundColor:'white'});
+v.addModel(%(pdb)s,"pdb");
+v.setStyle({}, %(style)s);
+v.addSurface($3Dmol.VDW, {opacity:0.6, color:'white'});
+
+let E=%(edges)s;
+const vals = E.map(e => e.M || 1);
+const vmin = Math.min(...vals), vmax = Math.max(...vals);
+const span = (vmax>vmin) ? (vmax - vmin) : 1;
+
+function heatColor(t){
+  var r=255, g=Math.round(255-180*t), b=Math.round(50*(1-t));
+  return 'rgb(' + r + ',' + g + ',' + b + ')';
+}
+
+E.sort((a,b) => (a.M||1) - (b.M||1));
+for (const e of E){
+  var t = ((e.M || 1) - vmin) / span;
+  var radius = %(rmin)f + (%(rmax)f - %(rmin)f) * t;
+  v.addCylinder({
+    start:{x:e.x1,y:e.y1,z:e.z1},
+    end:  {x:e.x2,y:e.y2,z:e.z2},
+    radius: radius,
+    fromCap:1, toCap:1,
+    color: heatColor(t)
+  });
+}
+
+// Save PNG
+const btn=document.createElement('button');
+btn.textContent='Save PNG';
+btn.style.position='absolute'; btn.style.top='10px'; btn.style.right='10px';
+document.body.appendChild(btn);
+btn.onclick=function(){ var a=document.createElement('a'); a.href=v.pngURI(); a.download='psn_overlay.png'; a.click(); };
+
 v.zoomTo(); v.render();
-</script></body></html>"""
+</script></body></html>
+""" % {"pdb": pdb_js, "style": style_obj_js, "edges": edges_js, "rmin": rmin, "rmax": rmax}
+
         return HTMLResponse(html)
     except Exception as ex:
         return HTMLResponse(f"<pre>Error: {ex}</pre>", status_code=500)
+
+
+# --- ROUTE B: build from PDB id, then reuse A ---
+@app.get("/viz/psn_build", response_class=HTMLResponse)
+def viz_psn_build(
+    pdb_id: str,
+    chains: str="A",
+    cutoff: float=4.5,
+    kmin: int=0,
+    style: str="cartoon",
+):
+    pdb_path = fetch_pdb_rcsb(pdb_id)
+    chain_list = [c.strip() for c in chains.split(",") if c.strip()]
+    wdf = _build_psn_weighted(pdb_path, cutoff=cutoff, chains=chain_list, heavy_only=True)
+    out_csv = Path(f"artifacts/runs/psn/{pdb_id}_c{cutoff}_{'-'.join(chain_list) or 'ALL'}.csv")
+    out_csv.parent.mkdir(parents=True, exist_ok=True)
+    wdf.to_csv(out_csv, index=False)
+    return viz_psn_net(pdb_path=pdb_path, edges_csv=str(out_csv), kmin=kmin, style=style)
