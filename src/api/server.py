@@ -168,6 +168,10 @@ def viz_psn_net(
     weight_by: str = "Contacts",   # or "Weight"
     rmin: float = 0.06,
     rmax: float = 0.35,
+    res_scores_csv: str = Query(None),
+    topk: int = 25,
+    node_rmin: float = 0.4,
+    node_rmax: float = 1.2,
 ):
     try:
         df = pd.read_csv(edges_csv)
@@ -193,6 +197,15 @@ def viz_psn_net(
 
         edges_js = json.dumps(cyl)
         pdb_js   = json.dumps(Path(pdb_path).read_text())
+
+        res_js = "null"
+        if res_scores_csv:
+            dfres = pd.read_csv(res_scores_csv)
+            # keep top-K by score
+            dfres = dfres.sort_values("score", ascending=False).head(topk)
+            res_list = [{"chain":str(r.chain), "resi":int(r.resi), "s":float(r.score)} for r in dfres.itertuples(index=False)]
+            res_js = json.dumps(res_list)
+
 
         style_map = {
             "cartoon": {"cartoon": {"color": "gray"}},
@@ -236,6 +249,19 @@ for (const e of E){
   });
 }
 
+// Residue highlights by score
+let R = %(res)s;
+if (R){
+  const svals = R.map(r => r.s);
+  const smin = Math.min(...svals), smax = Math.max(...svals), sspan = (smax>smin)?(smax-smin):1;
+  function nodeColor(t){ var r=255, g=Math.round(255-200*t), b=0; return 'rgb(' + r + ',' + g + ',' + b + ')'; }
+  for (const r of R){
+    var t = (r.s - smin)/sspan;
+    var rad = %(node_rmin)f + (%(node_rmax)f - %(node_rmin)f) * t;
+    v.setStyle({chain:r.chain, resi:r.resi}, {sphere:{radius:rad, color: nodeColor(t)}});
+  }
+}
+
 // Save PNG
 const btn=document.createElement('button');
 btn.textContent='Save PNG';
@@ -245,7 +271,15 @@ btn.onclick=function(){ var a=document.createElement('a'); a.href=v.pngURI(); a.
 
 v.zoomTo(); v.render();
 </script></body></html>
-""" % {"pdb": pdb_js, "style": style_obj_js, "edges": edges_js, "rmin": rmin, "rmax": rmax}
+""" % {"pdb": pdb_js, 
+       "style": style_obj_js, 
+       "edges": edges_js, 
+       "rmin": rmin, 
+       "rmax": rmax,
+       "res": res_js,         # <-- adds data for residue scores
+       "node_rmin": node_rmin,# <-- for node (sphere) min radius
+       "node_rmax": node_rmax # <-- for node (sphere) max radius
+       }
 
         return HTMLResponse(html)
     except Exception as ex:

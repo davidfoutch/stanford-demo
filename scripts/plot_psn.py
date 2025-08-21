@@ -8,12 +8,22 @@ def main(bundle, outdir):
     meta_json = bdir / "metadata.json"
     meta = json.loads(meta_json.read_text()) if meta_json.exists() else {}
 
-    df = pd.read_csv(edges_csv)  # cols: u,v[,w]
-    G = nx.Graph()
-    if {"u","v","w"}.issubset(df.columns):
-        G.add_weighted_edges_from(df[["u","v","w"]].itertuples(index=False))
+    df = pd.read_csv(edges_csv)
+
+    # choose node columns
+    if {'u','v'}.issubset(df.columns):
+        ucol, vcol = 'u', 'v'
     else:
-        G.add_edges_from(df[["u","v"]].itertuples(index=False))
+        ucol, vcol = 'Residue1', 'Residue2'  # from make_psn.py
+
+    # choose weight column (optional)
+    wcol = 'w' if 'w' in df.columns else ('Weight' if 'Weight' in df.columns else None)
+
+    G = nx.Graph()
+    if wcol:
+        G.add_weighted_edges_from(df[[ucol, vcol, wcol]].itertuples(index=False))
+    else:
+        G.add_edges_from(df[[ucol, vcol]].itertuples(index=False))
 
     pos = nx.spring_layout(G, seed=42)
     plt.figure()
