@@ -21,7 +21,7 @@ def fetch_pdb_rcsb(pdb_id:str, cache_dir=Path("data/cache/pdb"))->Path:
         r.raise_for_status(); out.write_text(r.text)
     return out
 
-def build_psn_weighted(pdb_path:Path, cutoff:float=4.5, chains=None, heavy_only=True)->pd.DataFrame:
+def build_psn_weighted(pdb_path:Path, cutoff:float=4.5, chains=None, kmin: int = 0, heavy_only: bool = True)->pd.DataFrame:
     parser = PDBParser(QUIET=True); s = parser.get_structure("s", str(pdb_path))
     chains = set(chains) if chains else None
     res_ids, coords = [], []
@@ -44,11 +44,19 @@ def build_psn_weighted(pdb_path:Path, cutoff:float=4.5, chains=None, heavy_only=
         u,v = (a,b) if a<b else (b,a)
         d = float(np.linalg.norm(coords[i]-coords[j]))
         edge[(u,v)].append(d)
-    rows=[]
-    for (u,v), ds in edge.items():
-        cnt=len(ds); avg=sum(ds)/cnt; w=cnt*avg
-        rows.append((u,v,w,cnt,avg))
-    return pd.DataFrame(rows, columns=["Residue1","Residue2","Weight","Contacts","AvgDist"])
+    rows = []
+    for (u, v), ds in edge.items():
+        cnt = len(ds)
+        if kmin and cnt < kmin:     # <-- apply threshold here
+            continue
+        avg = sum(ds) / cnt
+        w = cnt * avg
+        rows.append((u, v, w, cnt, avg))
+
+    return pd.DataFrame(
+        rows,
+        columns=["Residue1", "Residue2", "Weight", "Contacts", "AvgDist"],
+    )
 
 def parse_res_meta(pdb_path:Path):
     """Return dicts: resname['A:100']->'ASP', resseq['A:100']->100, bfac['A:100']->float."""
@@ -142,6 +150,8 @@ def main():
     ap.add_argument("--labels", required=True, help="CSV: pdb_id,chains,label")
     ap.add_argument("--out", default="artifacts/graphs")
     ap.add_argument("--cutoff", type=float, default=4.5)
+    ap.add_argument("--kmin", type=int, default=4) 
+    ap.add_argument("--heavy-only", action="store_true")
     args = ap.parse_args()
 
     labels = pd.read_csv(args.labels)

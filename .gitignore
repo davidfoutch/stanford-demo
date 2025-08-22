@@ -1,14 +1,4 @@
 .venv/
 __pycache__/
-.chroma/
-.env
-var/log/
-*.log
-
-artifacts/
-
-artifacts/
-.chroma/
-var/log/
-*.log
-
+*.pyc
+.DS_Store

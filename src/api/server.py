@@ -4,12 +4,13 @@ from typing import Optional
 import os
 import requests
 from pathlib import Path
+from urllib.parse import quote
 
 from src.companion.session import ChatSession
 from src.companion.example_llm import llm_call
 
-from fastapi.responses import HTMLResponse
-from fastapi import Query
+from fastapi.responses import HTMLResponse, RedirectResponse
+from fastapi import Query, HTTPException
 import pandas as pd, numpy as np, json
 from Bio.PDB import PDBParser, is_aa
 from scipy.spatial import cKDTree
@@ -290,15 +291,38 @@ v.zoomTo(); v.render();
 @app.get("/viz/psn_build", response_class=HTMLResponse)
 def viz_psn_build(
     pdb_id: str,
-    chains: str="A",
-    cutoff: float=4.5,
-    kmin: int=0,
-    style: str="cartoon",
+    chains: str = "A",
+    cutoff: float = 4.5,
+    kmin: int = 0,
+    style: str = "cartoon",
 ):
-    pdb_path = fetch_pdb_rcsb(pdb_id)
+    BASE = Path(__file__).resolve().parents[2]   # /home/david/stanford-demo
+    ART = BASE / "artifacts" / "runs" / "psn"
+    ART.mkdir(parents=True, exist_ok=True)
+
+    # 1) Fetch/cache PDB -> absolute path string
+    try:
+        pdb_path = Path(fetch_pdb_rcsb(pdb_id)).resolve()
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"RCSB fetch failed for {pdb_id}: {e}")
+
     chain_list = [c.strip() for c in chains.split(",") if c.strip()]
-    wdf = _build_psn_weighted(pdb_path, cutoff=cutoff, chains=chain_list, heavy_only=True)
-    out_csv = Path(f"artifacts/runs/psn/{pdb_id}_c{cutoff}_{'-'.join(chain_list) or 'ALL'}.csv")
-    out_csv.parent.mkdir(parents=True, exist_ok=True)
-    wdf.to_csv(out_csv, index=False)
-    return viz_psn_net(pdb_path=pdb_path, edges_csv=str(out_csv), kmin=kmin, style=style)
+
+    # 2) Build PSN (heavy atoms only) and write edges CSV
+    try:
+        wdf = _build_psn_weighted(str(pdb_path), cutoff=cutoff, chains=chain_list, heavy_only=True)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"PSN build failed for {pdb_id} chains={chain_list}: {e}")
+
+    edges_csv_path = (ART / f"test_{pdb_id}.csv").resolve()
+    wdf.to_csv(edges_csv_path, index=False)  # do NOT reassign this variable
+
+    # 3) Redirect to /viz/psn_net with URL-encoded absolute paths
+    url = (
+        "/viz/psn_net"
+        f"?pdb_path={quote(str(pdb_path))}"
+        f"&edges_csv={quote(str(edges_csv_path))}"
+        f"&kmin={kmin}"
+        f"&style={quote(style)}"
+    )
+    return RedirectResponse(url)
