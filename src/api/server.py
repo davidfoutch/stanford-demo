@@ -2,20 +2,66 @@ from fastapi import FastAPI
 from pydantic import BaseModel
 from typing import Optional
 import os
+import pandas as pd
 import requests
 from pathlib import Path
 from urllib.parse import quote
+import traceback
 
 from src.companion.session import ChatSession
 from src.companion.example_llm import llm_call
 
-from fastapi.responses import HTMLResponse, RedirectResponse
+from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse
 from fastapi import Query, HTTPException
 import pandas as pd, numpy as np, json
 from Bio.PDB import PDBParser, is_aa
 from scipy.spatial import cKDTree
 
 app = FastAPI(title="Stanford Demo API")
+
+@app.get("/routes")
+def list_routes():
+    return [{"path": r.path, "name": r.name, "methods": sorted(list(getattr(r, "methods", []) or []))} for r in app.router.routes]
+
+def _normalize_res_scores(res_scores_csv: str, topk: Optional[int] = None, default_chain: str = "A") -> Optional[pd.DataFrame]:
+    p = Path(res_scores_csv)
+    if not p.is_file():
+        raise HTTPException(status_code=400, detail=f"res_scores_csv not found: {p}")
+    df = pd.read_csv(p)
+    df.columns = [c.strip().lower() for c in df.columns]
+
+    # find/rename score column
+    score_col = next((c for c in ("score", "importance", "attr", "attribution", "saliency") if c in df.columns), None)
+    if score_col is None:
+        raise HTTPException(status_code=400, detail=f"res_scores_csv needs a 'score' column (or importance/attr): {p}")
+    if score_col != "score":
+        df = df.rename(columns={score_col: "score"})
+
+    # normalize to columns: chain, resnum, score
+    if "chain" in df.columns and ("resnum" in df.columns or "residue" in df.columns):
+        if "resnum" not in df.columns and "residue" in df.columns:
+            df["resnum"] = pd.to_numeric(df["residue"], errors="coerce")
+    elif "residue" in df.columns:
+        r = df["residue"].astype(str).str.strip()
+        # accept "A:123", "A 123", or "123" (defaults to A)
+        parsed = r.str.replace(r"\s+", ":", regex=True)
+        parts = parsed.str.split(":", n=1, expand=True)
+        if parts.shape[1] == 2 and (parsed.str.contains(":").any()):
+            df["chain"] = parts[0].str.strip()
+            df["resnum"] = pd.to_numeric(parts[1], errors="coerce")
+        else:
+            df["chain"] = default_chain
+            df["resnum"] = pd.to_numeric(r, errors="coerce")
+    elif "node" in df.columns:
+        # no mapping from node index → residue number available; skip highlights
+        return None
+    else:
+        return None
+
+    df = df.dropna(subset=["resnum"])
+    if topk:
+        df = df.sort_values("score", ascending=False).head(int(topk))
+    return df[["chain", "resnum", "score"]].copy()
 
 def fetch_pdb_rcsb(pdb_id: str) -> str:
     pdb_id = pdb_id.upper()
@@ -59,18 +105,6 @@ def _build_psn_weighted(pdb_path: str, cutoff: float = 4.5, chains=None, heavy_o
 def health():
     return {"ok": True}
 
-@app.get("/viz/psn_build", response_class=HTMLResponse)
-def viz_psn_build(pdb_id: str, chains: str="A", cutoff: float=4.5, kmin: int=0, style: str="cartoon"):
-    pdb_path = fetch_pdb_rcsb(pdb_id)
-    chain_list = [c.strip() for c in chains.split(",") if c.strip()]
-    wdf = _build_psn_weighted(pdb_path, cutoff=cutoff, chains=chain_list, heavy_only=True)
-
-    out_csv = Path(f"artifacts/runs/psn/{pdb_id}_c{cutoff}_{'-'.join(chain_list) or 'ALL'}.csv")
-    out_csv.parent.mkdir(parents=True, exist_ok=True)
-    wdf.to_csv(out_csv, index=False)
-
-    # Reuse the existing overlay viewer
-    return viz_psn_net(pdb_path=pdb_path, edges_csv=str(out_csv), kmin=kmin, style=style)
 
 # --- Companion ---
 class ChatIn(BaseModel):
@@ -117,48 +151,6 @@ def _ca_coords(pdb_path: str):
                     out[f"{ch.id}:{res.get_id()[1]}"] = res["CA"].coord.tolist()
     return out
 
-def fetch_pdb_rcsb(pdb_id: str) -> str:
-    pdb_id = pdb_id.upper()
-    out = Path(f"data/cache/pdb/{pdb_id}.pdb")
-    out.parent.mkdir(parents=True, exist_ok=True)
-    if not out.exists():
-        url = f"https://files.rcsb.org/download/{pdb_id}.pdb"
-        r = requests.get(url, timeout=20)
-        r.raise_for_status()
-        out.write_text(r.text)
-    return str(out)
-
-def _build_psn_weighted(pdb_path: str, cutoff: float = 4.5, chains=None, heavy_only: bool = True) -> pd.DataFrame:
-    parser = PDBParser(QUIET=True); s = parser.get_structure("s", pdb_path)
-    chains = set(chains) if chains else None
-    res_ids, coords = [], []
-    for model in s:
-        for ch in model:
-            if chains and ch.id not in chains: continue
-            for res in ch:
-                if not is_aa(res, standard=True): continue
-                for atom in res:
-                    if heavy_only and atom.element == "H": continue
-                    res_id = f"{ch.id}:{res.get_id()[1]}"
-                    res_ids.append(res_id); coords.append(atom.coord)
-    coords = np.asarray(coords, dtype=float)
-    tree = cKDTree(coords)
-    pairs = tree.query_pairs(r=cutoff)
-    from collections import defaultdict
-    edge = defaultdict(list)
-    for i,j in pairs:
-        a,b = res_ids[i], res_ids[j]
-        if a==b: continue
-        u,v = (a,b) if a<b else (b,a)
-        d = float(np.linalg.norm(coords[i]-coords[j]))
-        edge[(u,v)].append(d)
-    rows = []
-    for (u,v), ds in edge.items():
-        cnt = len(ds); avg = sum(ds)/cnt; w = cnt*avg
-        rows.append((u,v,w,cnt,avg))
-    return pd.DataFrame(rows, columns=["Residue1","Residue2","Weight","Contacts","AvgDist"])
-
-
 # --- ROUTE A: overlay a given PDB path + edges CSV ---
 @app.get("/viz/psn_net", response_class=HTMLResponse)
 def viz_psn_net(
@@ -166,7 +158,7 @@ def viz_psn_net(
     edges_csv: str = Query(...),
     kmin: int = 0,
     style: str = "cartoon",
-    weight_by: str = "Contacts",   # or "Weight"
+    weight_by: str = "Contacts",
     rmin: float = 0.06,
     rmax: float = 0.35,
     res_scores_csv: str = Query(None),
@@ -175,22 +167,43 @@ def viz_psn_net(
     node_rmax: float = 1.2,
 ):
     try:
+        # ---------- data prep ----------
+        pdb_path = str(Path(pdb_path).resolve())
+        edges_csv = str(Path(edges_csv).resolve())
+        if res_scores_csv in (None, "", "null", "None"):
+            res_scores_csv = None
+
+        if not Path(pdb_path).is_file():
+            raise HTTPException(status_code=400, detail=f"pdb_path not found: {pdb_path}")
+        if not Path(edges_csv).is_file():
+            raise HTTPException(status_code=400, detail=f"edges_csv not found: {edges_csv}")
+
         df = pd.read_csv(edges_csv)
-        u, v = ('u','v') if {'u','v'}.issubset(df.columns) else ('Residue1','Residue2')
+        res_scores = None
+        if res_scores_csv:
+            res_scores = _normalize_res_scores(res_scores_csv, topk=topk or None, default_chain="A")
+
+        u, v = ('u', 'v') if {'u', 'v'}.issubset(df.columns) else ('Residue1', 'Residue2')
         if kmin and 'Contacts' in df.columns:
             df = df[df['Contacts'] >= kmin]
 
         coords = _ca_coords(pdb_path)
         hasC = 'Contacts' in df.columns
         hasW = 'Weight'   in df.columns
-        metric = weight_by if (weight_by in df.columns) else ("Contacts" if hasC else ("Weight" if hasW else None))
+        if weight_by in df.columns:
+            metric = weight_by
+        elif hasC:
+            metric = 'Contacts'
+        elif hasW:
+            metric = 'Weight'
+        else:
+            metric = None
 
         cyl = []
         for _, row in df.iterrows():
             a, b = row[u], row[v]
             if a in coords and b in coords:
-                x1, y1, z1 = coords[a]
-                x2, y2, z2 = coords[b]
+                x1, y1, z1 = coords[a]; x2, y2, z2 = coords[b]
                 C = int(row['Contacts']) if hasC else 1
                 W = float(row['Weight']) if hasW else 1.0
                 M = float(row[metric]) if metric else 1.0
@@ -200,13 +213,13 @@ def viz_psn_net(
         pdb_js   = json.dumps(Path(pdb_path).read_text())
 
         res_js = "null"
-        if res_scores_csv:
-            dfres = pd.read_csv(res_scores_csv)
-            # keep top-K by score
-            dfres = dfres.sort_values("score", ascending=False).head(topk)
-            res_list = [{"chain":str(r.chain), "resi":int(r.resi), "s":float(r.score)} for r in dfres.itertuples(index=False)]
+        if res_scores is not None and len(res_scores) > 0:
+            dfres = res_scores.rename(columns={"resnum": "resi", "score": "s"})
+            if topk:
+                dfres = dfres.sort_values("s", ascending=False).head(int(topk))
+            res_list = [{"chain": str(r["chain"]), "resi": int(r["resi"]), "s": float(r["s"])}
+                        for _, r in dfres.iterrows()]
             res_js = json.dumps(res_list)
-
 
         style_map = {
             "cartoon": {"cartoon": {"color": "gray"}},
@@ -215,6 +228,7 @@ def viz_psn_net(
         }
         style_obj_js = json.dumps(style_map.get(style, style_map["cartoon"]))
 
+        # ---------- render HTML once ----------
         html = """
 <!doctype html><html><head>
 <meta charset="utf-8" />
@@ -225,8 +239,6 @@ def viz_psn_net(
 let v=$3Dmol.createViewer(document.getElementById('viewer'),{backgroundColor:'white'});
 v.addModel(%(pdb)s,"pdb");
 v.setStyle({}, %(style)s);
-v.addSurface($3Dmol.VDW, {opacity:0.6, color:'white'});
-
 let E=%(edges)s;
 const vals = E.map(e => e.M || 1);
 const vmin = Math.min(...vals), vmax = Math.max(...vals);
@@ -236,18 +248,12 @@ function heatColor(t){
   var r=255, g=Math.round(255-180*t), b=Math.round(50*(1-t));
   return 'rgb(' + r + ',' + g + ',' + b + ')';
 }
-
 E.sort((a,b) => (a.M||1) - (b.M||1));
 for (const e of E){
   var t = ((e.M || 1) - vmin) / span;
   var radius = %(rmin)f + (%(rmax)f - %(rmin)f) * t;
-  v.addCylinder({
-    start:{x:e.x1,y:e.y1,z:e.z1},
-    end:  {x:e.x2,y:e.y2,z:e.z2},
-    radius: radius,
-    fromCap:1, toCap:1,
-    color: heatColor(t)
-  });
+  v.addCylinder({ start:{x:e.x1,y:e.y1,z:e.z1}, end:{x:e.x2,y:e.y2,z:e.z2},
+                  radius: radius, fromCap:1, toCap:1, color: heatColor(t) });
 }
 
 // Residue highlights by score
@@ -272,20 +278,24 @@ btn.onclick=function(){ var a=document.createElement('a'); a.href=v.pngURI(); a.
 
 v.zoomTo(); v.render();
 </script></body></html>
-""" % {"pdb": pdb_js, 
-       "style": style_obj_js, 
-       "edges": edges_js, 
-       "rmin": rmin, 
-       "rmax": rmax,
-       "res": res_js,         # <-- adds data for residue scores
-       "node_rmin": node_rmin,# <-- for node (sphere) min radius
-       "node_rmax": node_rmax # <-- for node (sphere) max radius
-       }
-
+""" % {
+    "pdb": pdb_js,
+    "style": style_obj_js,
+    "edges": edges_js,
+    "rmin": rmin,
+    "rmax": rmax,
+    "res": res_js,
+    "node_rmin": node_rmin,
+    "node_rmax": node_rmax,
+}
         return HTMLResponse(html)
-    except Exception as ex:
-        return HTMLResponse(f"<pre>Error: {ex}</pre>", status_code=500)
 
+    except HTTPException:
+        # re-throw FastAPI errors (become proper 4xx)
+        raise
+    except Exception as ex:
+        # fallback HTML error page (single return)
+        return HTMLResponse(f"<pre>/viz/psn_net failed: {ex}</pre>", status_code=500)
 
 # --- ROUTE B: build from PDB id, then reuse A ---
 @app.get("/viz/psn_build", response_class=HTMLResponse)
@@ -295,34 +305,88 @@ def viz_psn_build(
     cutoff: float = 4.5,
     kmin: int = 0,
     style: str = "cartoon",
+    debug: int = 0,   # if 1 → return JSON snapshot / errors
 ):
-    BASE = Path(__file__).resolve().parents[2]   # /home/david/stanford-demo
-    ART = BASE / "artifacts" / "runs" / "psn"
-    ART.mkdir(parents=True, exist_ok=True)
-
-    # 1) Fetch/cache PDB -> absolute path string
+    stage = "start"
+    snap = {"pdb_id": pdb_id, "chains": chains, "cutoff": cutoff, "kmin": kmin, "style": style}
     try:
-        pdb_path = Path(fetch_pdb_rcsb(pdb_id)).resolve()
+        BASE = Path(__file__).resolve().parents[2]
+        ART  = (BASE / "artifacts" / "runs" / "psn"); ART.mkdir(parents=True, exist_ok=True)
+        PDB_CACHE = (BASE / "data" / "cache" / "pdb"); PDB_CACHE.mkdir(parents=True, exist_ok=True)
+
+        stage = "fetch_pdb"
+        ret = fetch_pdb_rcsb(pdb_id)
+        snap["fetch_type"] = str(type(ret))
+
+        pdb_fp = Path(str(ret))
+        if pdb_fp.exists():
+            pdb_fp = pdb_fp.resolve()
+        else:
+            stage = "write_pdb_text"
+            txt = ret if isinstance(ret, str) else str(ret)
+            snap["pdb_text_prefix"] = txt[:60]
+            if "ATOM" not in txt and "HEADER" not in txt and "MODEL" not in txt:
+                raise HTTPException(status_code=502, detail=f"Unexpected PDB response for {pdb_id}: type={type(ret)}")
+            pdb_fp = (PDB_CACHE / f"{pdb_id}.pdb").resolve()
+            pdb_fp.write_text(txt)
+
+        snap["pdb_path"] = str(pdb_fp)
+
+        stage = "prepare_paths"
+        chain_list = [c.strip() for c in chains.split(",") if c.strip()]
+        out_csv = (ART / f"{pdb_id}_c{cutoff:g}_{'-'.join(chain_list) or 'ALL'}.csv").resolve()
+        snap["edges_csv"] = str(out_csv)
+        snap["chain_list"] = chain_list
+
+        stage = "resolve_builder"
+        try:
+            builder = _build_psn_weighted  # noqa: F821
+        except NameError:
+            try:
+                builder = build_psn_weighted  # noqa: F821
+            except NameError:
+                raise HTTPException(status_code=500, detail="No PSN builder found (_build_psn_weighted/build_psn_weighted)")
+
+        stage = "build_psn"
+        try:
+            wdf = builder(str(pdb_fp), cutoff=cutoff, chains=chain_list, kmin=kmin, heavy_only=True)
+        except TypeError:
+            wdf = builder(str(pdb_fp), cutoff=cutoff, chains=chain_list, heavy_only=True)
+            if kmin and 'Contacts' in wdf.columns:
+                wdf = wdf[wdf['Contacts'] >= kmin].reset_index(drop=True)
+
+        if not isinstance(wdf, pd.DataFrame):
+            raise HTTPException(status_code=500, detail=f"PSN builder returned {type(wdf)} (expected DataFrame)")
+        if wdf.empty:
+            raise HTTPException(status_code=400, detail=f"PSN empty: pdb={pdb_id} chains={chain_list} cutoff={cutoff}")
+
+        stage = "write_csv"
+        wdf.to_csv(out_csv, index=False)
+        snap["rows"] = int(len(wdf))
+        snap["cols"] = list(wdf.columns)
+
+        if debug:
+            stage = "debug_return"
+            return JSONResponse({"stage": stage, **snap})
+
+        stage = "redirect"
+        url = (
+            "/viz/psn_net"
+            f"?pdb_path={quote(str(pdb_fp))}"
+            f"&edges_csv={quote(str(out_csv))}"
+            f"&kmin={kmin}"
+            f"&style={quote(style)}"
+        )
+        return RedirectResponse(url, status_code=307)
+
+    except HTTPException as e:
+        if debug:
+            return JSONResponse({"stage": stage, "error": e.detail, **snap}, status_code=e.status_code)
+        raise
     except Exception as e:
-        raise HTTPException(status_code=502, detail=f"RCSB fetch failed for {pdb_id}: {e}")
-
-    chain_list = [c.strip() for c in chains.split(",") if c.strip()]
-
-    # 2) Build PSN (heavy atoms only) and write edges CSV
-    try:
-        wdf = _build_psn_weighted(str(pdb_path), cutoff=cutoff, chains=chain_list, heavy_only=True)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"PSN build failed for {pdb_id} chains={chain_list}: {e}")
-
-    edges_csv_path = (ART / f"test_{pdb_id}.csv").resolve()
-    wdf.to_csv(edges_csv_path, index=False)  # do NOT reassign this variable
-
-    # 3) Redirect to /viz/psn_net with URL-encoded absolute paths
-    url = (
-        "/viz/psn_net"
-        f"?pdb_path={quote(str(pdb_path))}"
-        f"&edges_csv={quote(str(edges_csv_path))}"
-        f"&kmin={kmin}"
-        f"&style={quote(style)}"
-    )
-    return RedirectResponse(url)
+        if debug:
+            return JSONResponse(
+                {"stage": stage, "error": str(e), "trace": traceback.format_exc(), **snap},
+                status_code=500
+            )
+        raise HTTPException(status_code=500, detail=f"/viz/psn_build failed: {e}")
