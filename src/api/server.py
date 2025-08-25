@@ -2,6 +2,7 @@ from fastapi import FastAPI
 from pydantic import BaseModel
 from typing import Optional
 import os
+import re
 import pandas as pd
 import requests
 from pathlib import Path
@@ -165,6 +166,9 @@ def viz_psn_net(
     topk: int = 25,
     node_rmin: float = 0.4,
     node_rmax: float = 1.2,
+    labels: int = 1,        
+    debug_js: int = 0,   
+    legend: int =1,  
 ):
     try:
         # ---------- data prep ----------
@@ -199,6 +203,21 @@ def viz_psn_net(
         else:
             metric = None
 
+        # --- enforce PDB↔CSV consistency ---
+        pdb_id_from_path = Path(pdb_path).stem[:4].upper()
+        m = re.search(r'([0-9][A-Za-z0-9]{3})', Path(edges_csv).stem)
+        csv_id = m.group(1).upper() if m else None
+        if csv_id and csv_id != pdb_id_from_path:
+            raise HTTPException(status_code=400, detail=f"pdb_id mismatch: PDB={pdb_id_from_path}, CSV={csv_id}")
+
+        valid = set(_ca_coords(pdb_path).keys())
+        u, v = ('u','v') if {'u','v'}.issubset(df.columns) else ('Residue1','Residue2')
+        mask = df[u].isin(valid) & df[v].isin(valid)
+        dropped = int((~mask).sum())
+        if dropped > 0:
+            raise HTTPException(status_code=400, detail=f"Residue mismatch: dropped {dropped} edges not present in {Path(pdb_path).name}")
+        df = df[mask].reset_index(drop=True)
+
         cyl = []
         for _, row in df.iterrows():
             a, b = row[u], row[v]
@@ -207,7 +226,7 @@ def viz_psn_net(
                 C = int(row['Contacts']) if hasC else 1
                 W = float(row['Weight']) if hasW else 1.0
                 M = float(row[metric]) if metric else 1.0
-                cyl.append({"x1":x1,"y1":y1,"z1":z1,"x2":x2,"y2":y2,"z2":z2,"C":C,"W":W,"M":M})
+                cyl.append({"a":a,"b":b,"x1":x1,"y1":y1,"z1":z1,"x2":x2,"y2":y2,"z2":z2,"C":C,"W":W,"M":M})
 
         edges_js = json.dumps(cyl)
         pdb_js   = json.dumps(Path(pdb_path).read_text())
@@ -232,52 +251,154 @@ def viz_psn_net(
         html = """
 <!doctype html><html><head>
 <meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
 <script src="https://cdnjs.cloudflare.com/ajax/libs/3Dmol/2.0.5/3Dmol-min.js"></script>
-<style>html,body,#viewer{height:100%%;margin:0}#viewer{width:100%%;height:100%%}</style>
-</head><body><div id="viewer"></div>
+<style>
+  html,body,#viewer{height:100%%;margin:0}
+  #viewer{width:100%%;height:100%%;background:#fff}
+  #dbg{position:fixed;bottom:0;left:0;right:0;max-height:35%%;overflow:auto;
+       font:12px/1.4 monospace;background:rgba(0,0,0,.75);color:#fff;padding:8px;display:none}
+  #btn{position:absolute;top:10px;right:10px;z-index:10}
+  #leg{position:absolute;left:10px;top:10px;background:rgba(255,255,255,.92);
+     border:1px solid #ddd;padding:8px 10px;font:12px system-ui;border-radius:8px;display:none}
+</style>
+</head><body>
+<div id="viewer"></div><pre id="dbg"></pre><div id="leg"></div>
 <script>
-let v=$3Dmol.createViewer(document.getElementById('viewer'),{backgroundColor:'white'});
-v.addModel(%(pdb)s,"pdb");
-v.setStyle({}, %(style)s);
-let E=%(edges)s;
-const vals = E.map(e => e.M || 1);
-const vmin = Math.min(...vals), vmax = Math.max(...vals);
-const span = (vmax>vmin) ? (vmax - vmin) : 1;
-
-function heatColor(t){
-  var r=255, g=Math.round(255-180*t), b=Math.round(50*(1-t));
-  return 'rgb(' + r + ',' + g + ',' + b + ')';
-}
-E.sort((a,b) => (a.M||1) - (b.M||1));
-for (const e of E){
-  var t = ((e.M || 1) - vmin) / span;
-  var radius = %(rmin)f + (%(rmax)f - %(rmin)f) * t;
-  v.addCylinder({ start:{x:e.x1,y:e.y1,z:e.z1}, end:{x:e.x2,y:e.y2,z:e.z2},
-                  radius: radius, fromCap:1, toCap:1, color: heatColor(t) });
-}
-
-// Residue highlights by score
-let R = %(res)s;
-if (R){
-  const svals = R.map(r => r.s);
-  const smin = Math.min(...svals), smax = Math.max(...svals), sspan = (smax>smin)?(smax-smin):1;
-  function nodeColor(t){ var r=255, g=Math.round(255-200*t), b=0; return 'rgb(' + r + ',' + g + ',' + b + ')'; }
-  for (const r of R){
-    var t = (r.s - smin)/sspan;
-    var rad = %(node_rmin)f + (%(node_rmax)f - %(node_rmin)f) * t;
-    v.setStyle({chain:r.chain, resi:r.resi}, {sphere:{radius:rad, color: nodeColor(t)}});
+(function(){
+  const DEBUG = %(debug_js)d===1;
+  function show(msg){
+    const el = document.getElementById('dbg');
+    el.style.display='block';
+    el.textContent += (typeof msg==='string'?msg:(msg&&msg.stack)||String(msg)) + "\\n";
   }
-}
+  if (DEBUG){
+    window.onerror = (m,src,ln,col,err)=>show(err||m);
+    window.addEventListener('unhandledrejection', e=>show(e.reason||e));
+  }
+  try {
+    const root = document.getElementById('viewer');
+    root.style.outline = '2px solid #eaeaea';
+    if (DEBUG) show("[init] script started");
+    if (typeof window.$3Dmol === 'undefined'){
+      show("[fatal] 3Dmol not loaded");
+      root.innerHTML = "<div style='padding:1rem;font:14px system-ui'>3Dmol failed to load.</div>";
+      return;
+    }
 
-// Save PNG
-const btn=document.createElement('button');
-btn.textContent='Save PNG';
-btn.style.position='absolute'; btn.style.top='10px'; btn.style.right='10px';
-document.body.appendChild(btn);
-btn.onclick=function(){ var a=document.createElement('a'); a.href=v.pngURI(); a.download='psn_overlay.png'; a.click(); };
+    let v=$3Dmol.createViewer(root,{backgroundColor:'white'});
 
-v.zoomTo(); v.render();
-</script></body></html>
+    // PDB model + style
+    const pdbTxt = %(pdb)s;
+    v.addModel(pdbTxt,"pdb");
+    const styleObj = %(style)s;
+    v.setStyle({}, styleObj);
+
+    // Edges/cylinders
+    const E = %(edges)s;
+    const vals = E.length ? E.map(e => e.M || 1) : [1];
+    const vmin = Math.min(...vals), vmax = Math.max(...vals);
+    let sminVal = null, smaxVal = null;
+    const span = (vmax>vmin) ? (vmax - vmin) : 1;
+    function heatColor(t){ var r=255, g=Math.round(255-180*t), b=Math.round(50*(1-t));
+      return 'rgb(' + r + ',' + g + ',' + b + ')'; }
+
+    E.sort((a,b) => (a.M||1) - (b.M||1));
+    let drawn = 0;
+    for (const e of E){
+      var t = ((e.M || 1) - vmin) / span;
+      var radius = %(rmin)f + (%(rmax)f - %(rmin)f) * t;
+      if (isFinite(radius) && radius>0){
+        v.addCylinder({
+          start:{x:e.x1,y:e.y1,z:e.z1},
+          end:  {x:e.x2,y:e.y2,z:e.z2},
+          radius: radius, fromCap:1, toCap:1,
+          color: heatColor(t)
+        });
+        drawn++;
+      }
+    }
+
+    // Residue highlights by score
+    let R = %(res)s;
+    if (R && Array.isArray(R) && R.length){
+    const svals = R.map(r => r.s);
+    const smin = Math.min(...svals), smax = Math.max(...svals), sspan = (smax>smin)?(smax-smin):1;
+    sminVal = smin; smaxVal = smax;
+    function nodeColor(t){ var r=255, g=Math.round(255-200*t), b=0; return 'rgb(' + r + ',' + g + ',' + b + ')'; }
+    for (const r of R){
+        var t = (r.s - smin)/sspan;
+        var rad = %(node_rmin)f + (%(node_rmax)f - %(node_rmin)f) * t;
+        if (isFinite(rad) && rad>0){
+        v.setStyle({chain:r.chain, resi:r.resi}, {sphere:{radius:rad, color: nodeColor(t)}});
+        }
+    }
+    }
+
+    // Hover & click labels (optional)
+    if (%(labels)d === 1 && v.setHoverable && v.setClickable){
+      try {
+        const DEG = {};
+        for (const e of E){ if (!e || !e.a || !e.b) continue;
+          DEG[e.a] = (DEG[e.a]||0)+1; DEG[e.b] = (DEG[e.b]||0)+1; }
+        const RMAP = new Map();
+        if (R) for (const r of R) RMAP.set(`${r.chain}:${r.resi}`, Number(r.s)||0);
+
+        let hoverLabel=null, pinnedLabel=null;
+        v.setHoverable({}, true,
+          function(atom, viewer){
+            if (!atom || atom.resi==null || !atom.chain) return;
+            const key = `${atom.chain}:${atom.resi}`;
+            const deg = DEG[key]||0;
+            const sc  = RMAP.has(key) ? `; score=${(RMAP.get(key)||0).toFixed(3)}` : '';
+            const rn  = atom.resn ? ` ${atom.resn}` : '';
+            const txt = `${key}${rn} (deg=${deg}${sc})`;
+            if (hoverLabel) viewer.removeLabel(hoverLabel);
+            hoverLabel = viewer.addLabel(txt, {
+              position: atom, backgroundColor:'black', backgroundOpacity:0.7,
+              fontColor:'white', fontSize:12, inFront:true, alignment:'left'
+            });
+            viewer.render();
+          },
+          function(atom, viewer){
+            if (!pinnedLabel && hoverLabel){ viewer.removeLabel(hoverLabel); hoverLabel=null; viewer.render(); }
+          }
+        );
+        v.setClickable({}, true, function(atom, viewer){
+          if (!atom || atom.resi==null || !atom.chain) return;
+          const key = `${atom.chain}:${atom.resi}`;
+          const deg = DEG[key]||0;
+          const sc  = RMAP.has(key) ? `; score=${(RMAP.get(key)||0).toFixed(3)}` : '';
+          const rn  = atom.resn ? ` ${atom.resn}` : '';
+          const txt = `${key}${rn} (deg=${deg}${sc})`;
+          if (pinnedLabel) viewer.removeLabel(pinnedLabel);
+          pinnedLabel = viewer.addLabel(txt, {
+            position: atom, backgroundColor:'black', backgroundOpacity:0.85,
+            fontColor:'white', fontSize:14, inFront:true, alignment:'left'
+          });
+          viewer.render();
+        });
+      } catch(e){ if (DEBUG) show(e); }
+    }
+
+    // Save PNG
+    const btn=document.createElement('button');
+    btn.id='btn'; btn.textContent='Save PNG';
+    document.body.appendChild(btn);
+    btn.onclick=function(){ var a=document.createElement('a'); a.href=v.pngURI(); a.download='psn_overlay.png'; a.click(); };
+    if (%(legend)d === 1){
+        const el = document.getElementById('leg');
+        let html = `<b>Edges</b> (metric=%(metric)s, kmin=%(kmin)d)<br>vmin=${vmin.toFixed(3)} vmax=${vmax.toFixed(3)}`;
+        if (sminVal !== null && smaxVal !== null){
+            html += `<br><b>Residues</b> (topk=%(topk)d)<br>smin=${sminVal.toFixed(3)} smax=${smaxVal.toFixed(3)}`;
+        }
+        el.innerHTML = html; el.style.display = 'block';
+    }
+    v.zoomTo(); v.render();
+  } catch (e) { if (DEBUG) show(e); }
+})();
+</script>
+</body></html>
 """ % {
     "pdb": pdb_js,
     "style": style_obj_js,
@@ -287,15 +408,19 @@ v.zoomTo(); v.render();
     "res": res_js,
     "node_rmin": node_rmin,
     "node_rmax": node_rmax,
-}
+    "labels": labels,
+    "debug_js": debug_js,
+    "legend": legend,
+    "metric": metric or "",
+    "topk": int(topk) if topk else 0,
+    "kmin": int(kmin),
+    }
         return HTMLResponse(html)
-
     except HTTPException:
-        # re-throw FastAPI errors (become proper 4xx)
         raise
     except Exception as ex:
-        # fallback HTML error page (single return)
         return HTMLResponse(f"<pre>/viz/psn_net failed: {ex}</pre>", status_code=500)
+
 
 # --- ROUTE B: build from PDB id, then reuse A ---
 @app.get("/viz/psn_build", response_class=HTMLResponse)
@@ -376,6 +501,7 @@ def viz_psn_build(
             f"&edges_csv={quote(str(out_csv))}"
             f"&kmin={kmin}"
             f"&style={quote(style)}"
+            f"&strict=1"
         )
         return RedirectResponse(url, status_code=307)
 

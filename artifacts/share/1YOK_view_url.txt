@@ -1,0 +1,1 @@
+http://10.0.0.9:8000/viz/psn_net?pdb_path=/home/david/stanford-demo/data/cache/pdb/1YOK.pdb&edges_csv=/home/david/stanford-demo/artifacts/runs/psn/1YOK_c4.5_A.csv&kmin=4&style=cartoon&labels=1&res_scores_csv=/home/david/stanford-demo/artifacts/importance/1YOK_res_scores.csv&topk=10&node_rmin=0.35&node_rmax=1.0
