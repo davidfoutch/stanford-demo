@@ -115,6 +115,19 @@ class GATGraphClassifier(nn.Module):
             x = self.gat2(x, edge_index).relu()
         g = global_mean_pool(x, batch)
         return self.lin(g)
+    
+    def forward_with_attn(self, x, edge_index, edge_attr, batch):
+        # same branches you use in forward(), but ask for attention weights
+        if self.use_edges and edge_attr is not None:
+            x1, (e1, a1) = self.gat1(x, edge_index, edge_attr, return_attention_weights=True)
+            x1 = x1.relu()
+            x2, (e2, a2) = self.gat2(x1, edge_index, edge_attr, return_attention_weights=True)
+        else:
+            x1, (e1, a1) = self.gat1(x, edge_index, return_attention_weights=True); x1 = x1.relu()
+            x2, (e2, a2) = self.gat2(x1, edge_index, return_attention_weights=True)
+        g = global_mean_pool(x2.relu(), batch)
+        logits = self.lin(g)
+        return logits, [(e1, a1), (e2, a2)]  # edge_index, attention per layer
 
 # ---------- training ----------
 def run_epoch(model, loader, crit, opt=None, device="cpu"):
