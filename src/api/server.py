@@ -1,4 +1,5 @@
 from fastapi import FastAPI
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from typing import Optional
 import os
@@ -19,7 +20,7 @@ from Bio.PDB import PDBParser, is_aa
 from scipy.spatial import cKDTree
 
 app = FastAPI(title="Stanford Demo API")
-
+app.mount("/static", StaticFiles(directory="static"), name="static")
 @app.get("/routes")
 def list_routes():
     return [{"path": r.path, "name": r.name, "methods": sorted(list(getattr(r, "methods", []) or []))} for r in app.router.routes]
